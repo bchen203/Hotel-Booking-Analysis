@@ -1,0 +1,728 @@
+---
+title: "Predicting Hotel Cancellations"
+author: "Brendan Cheng, Alex Szeto, Chlinton Kuang, Dylan Sevilla"
+date: "2023-06-09"
+output:
+  pdf_document:
+    toc: yes
+  html:
+    toc: yes
+---
+
+
+***
+\newpage
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Contributions
+
+* Brendan Cheng
+    * EDA (3, 4)
+    * Logistic Regression
+    * KNN
+    
+* Alex Szeto
+    * EDA (7, 8)
+    * Decision Tree
+    
+* Chlinton Kuang
+    * EDA (5, 6)
+    * KNN
+    
+* Dylan Sevilla
+    * EDA (1, 2)
+
+# Introduction
+Our data is from 2 hotels in Portugal, the City Hotel and the Resort Hotel.  We have 119390 bookings from 2015-2017 with 32 variables. The variables contain a variety of information about each booking made, including the number of guests, the nightly rate, the date of the room reservation, etc. We would like to determine which of the variables are relevant in predicting whether a booking will be cancelled, and build predictive models using such variables.
+
+The datasets used can be accessed through the following links:
+
+* [hotel booking data](https://www.kaggle.com/datasets/jessemostipak/hotel-booking-demand)
+
+* [regional codes to classify countries into regions/continents](https://github.com/lukes/ISO-3166-Countries-with-Regional-Codes/blob/master/all/all.csv)
+
+***
+\newpage
+
+# Loading Data and Libraries
+
+```{r, message = F}
+library(tidyverse)
+library(caret)
+library(rpart)
+library(rpart.plot)
+library(ISLR)
+library(boot)
+library(gridExtra)
+
+hotel_bookings = read_csv("hotel_bookings.csv", show_col_types = FALSE)
+country_codes = read_csv("country_codes.csv", show_col_types = FALSE)
+```
+
+# Data Cleaning and Preprocessing
+
+```{r}
+hotel_bookings = hotel_bookings %>%
+    mutate(country = ifelse(country == "CN", "CHN", country))
+
+country_codes = country_codes %>% select("name", "alpha-3", "region", "sub-region") %>%
+    rename("country name" = "name", "subregion" = "sub-region")
+
+# attach country data to bookings data
+hotel_bookings = left_join(hotel_bookings, country_codes, by = c("country" = "alpha-3"))
+
+hotel_bookings = hotel_bookings %>%
+    mutate(season = case_when(arrival_date_month %in%
+                                  c("December", "January", "Feburuary") ~ "Winter",
+                              arrival_date_month %in%
+                                  c("March", "April", "May") ~ "Spring",
+                              arrival_date_month %in%
+                                  c("June","July", "August") ~ "Summer",
+                              .default = "Fall"))
+hotel_bookings = hotel_bookings %>%
+  mutate(num_nights = stays_in_weekend_nights + stays_in_week_nights, total_cost = adr*num_nights)
+dim(hotel_bookings)
+```
+
+***
+\newpage
+
+# EDA
+
+## 1. What is the busiest months/seasons for hotel bookings? Are the busiest months/seasons correlated with more expensive prices?
+
+```{r}
+fig1 = ggplot(hotel_bookings) +
+    geom_bar(aes(x = season, group = is_canceled, fill = factor(is_canceled))) +
+    labs(title = "Cancelled Bookings by Season")
+fig2 = ggplot(hotel_bookings) +
+    geom_bar(aes(x = arrival_date_month, group = is_canceled, fill = factor(is_canceled))) +
+    labs(title = "Cancelled Bookings by Month") + coord_flip()
+
+grid.arrange(fig1, fig2)
+```
+
+Summer is the busiest season with most of the days being reserved for August. Winter is off-peak season with barely any bookings compared to the other 3 seasons.
+
+```{r}
+fig3 = ggplot(hotel_bookings) +
+    geom_bar(aes(x = season, group = is_canceled, fill = factor(is_canceled)),
+             position = "fill") +
+    labs(title="Cancelation Rate by Season")
+fig4 = ggplot(hotel_bookings) +
+    geom_bar(aes(x = arrival_date_month, group = is_canceled, fill = factor(is_canceled)),
+             position = "fill") +
+    labs(title = "Cancelation Rate by Season")+ coord_flip()
+
+grid.arrange(fig3, fig4)
+```
+The cancellation rate is very consistent throughout each season and/or month.
+
+```{r, echo = F}
+month_table = hotel_bookings %>%
+    group_by(arrival_date_month) %>%
+    summarize(total_canceled = sum(is_canceled),
+              total_trips = n(),
+              cancel_rate = total_canceled/total_trips,
+              avg_rate = mean(adr),
+              avg_cost = mean(total_cost), avg_nights = mean(num_nights))
+month_table
+```
+
+```{r, message = F, echo = F}
+ggplot(month_table) +
+    geom_point(aes(x = avg_rate, y = avg_nights, color = total_trips), size = 3) +
+    geom_smooth(aes(x = avg_rate, y = avg_nights),
+                se = F, method = "lm", color = "darkgray")
+```
+
+The graph shows that the months with higher amounts of bookings also tend to have higher nightly rates as well as longer trips. In tandem, both of these trends indicate that trips during busier months tend to be more expensive.
+
+***
+\newpage
+
+## 2. What percentage of stays are booked in advance? How far in advance are they booked and is that correlated with the likelihood of cancellation?
+
+```{r, collapse = T}
+bookings_advance = hotel_bookings %>% mutate(book_adv = lead_time != 0) %>%
+  select(is_canceled, lead_time, book_adv)
+
+mean(bookings_advance$book_adv)
+mean(bookings_advance$lead_time)
+median(bookings_advance$lead_time)
+```
+
+```{r, echo = F}
+cancel_lead_time = glm(is_canceled ~ lead_time, data = bookings_advance, family = binomial)
+summary(cancel_lead_time)
+```
+
+```{r, echo = F}
+predict_cancel_time = predict(cancel_lead_time, type = "response")
+bookings_advance = bookings_advance %>%
+  mutate(is_canceled = as.logical(is_canceled), prob = predict_cancel_time, predict_cancel = prob>0.5)
+```
+
+```{r, echo = F}
+confusion.matrix = table(bookings_advance$is_canceled, bookings_advance$predict_cancel)
+confusion.matrix
+
+TN = confusion.matrix["FALSE", "FALSE"]
+TP = confusion.matrix["TRUE", "TRUE"]
+FP = confusion.matrix["FALSE", "TRUE"]
+FN = confusion.matrix["TRUE", "FALSE"]
+
+print(paste("Accuracy:", (TN + TP) / nrow(bookings_advance)))
+print(paste("TPR:", TP / (TP + FN)))
+print(paste("TNR:", TN / (TN + FP)))
+```
+Predicting cancellation from `lead_time` is surprisingly effective, with an accuracy of 66.1%, TPR of 27.8%, and TNR of 88.7%. This performance reveals that `lead_time` is a strong predictor of cancellation, since there are significant quantities of predictions for both categories.
+
+***
+\newpage
+
+## 3. What continents/region are people booking from? Which season do the most people travel from each continent/region?
+```{r, message = F, echo = F, fig.height = 4}
+# drop columns with unknown region
+region = hotel_bookings %>% filter(!is.na(region))
+season_region = region %>% group_by(season, region) %>% summarize(count = n())
+
+hm1 = ggplot(data = season_region) +
+    geom_tile(mapping = aes(x = season, y = region, fill = count)) +
+    scale_fill_gradient(low = "#FFF5F0", high = "red") +
+    labs(title = "Bookings by Region, Season")
+
+# heat map without Europe
+hm2 = ggplot(data = season_region %>% filter(region != "Europe")) +
+    geom_tile(mapping = aes(x = season, y = region, fill = count)) +
+    scale_fill_gradient(low = "#FFF5F0", high = "red") +
+    labs(title = "Bookings by Region, Season; No Europe")
+
+grid.arrange(hm1, hm2, nrow = 2)
+```
+
+According to the first heat map, Europe is the region which has the most bookings by a large amount. The second heat map reveals that the Americas and Asia are the regions with the second and third most bookings respectively. Summer appears to be the most popular season in each region, while fall and spring have similar amounts of overall bookings. Winter appears to be the least popular season regardless of region.
+
+```{r, message = F, echo = F, fig.height = 4}
+season_subregion = region %>% group_by(season, region, subregion) %>% summarize(count = n())
+
+hm3 = ggplot(data = season_subregion) +
+    geom_tile(mapping = aes(x = season, y = subregion, fill = count)) +
+    scale_fill_gradient(low = "#FFF5F0", high = "red") +
+    labs(title = "Bookings by Sub-Region, Season")
+
+# Non-European sub-regions
+hm4 = ggplot(data = season_subregion %>% filter(region != "Europe")) +
+    geom_tile(mapping = aes(x = season, y = subregion, fill = count)) +
+    scale_fill_gradient(low = "#FFF5F0", high = "red") +
+    labs(title = "Bookings by Sub-Region, Season; No Europe")
+
+grid.arrange(hm3, hm4, nrow = 2)
+```
+```{r, echo = F, fig.height = 4}
+hm5 = ggplot(data = season_subregion %>% filter(region == "Europe")) +
+    geom_tile(mapping = aes(x = season, y = subregion, fill = count)) +
+    scale_fill_gradient(low = "#FFF5F0", high = "red") +
+    labs(title = "Bookings by Sub-Region, Season; Europe")
+
+hm6 = ggplot(data = season_subregion %>% filter(region == "Americas")) +
+    geom_tile(mapping = aes(x = season, y = subregion, fill = count)) +
+    scale_fill_gradient(low = "#FFF5F0", high = "red") +
+    labs(title = "Bookings by Sub-Region, Season; Americas")
+
+hm7 = ggplot(data = season_subregion %>% filter(region == "Asia")) +
+    geom_tile(mapping = aes(x = season, y = subregion, fill = count)) +
+    scale_fill_gradient(low = "#FFF5F0", high = "red") +
+    labs(title = "Bookings by Sub-Region, Season; Asia")
+
+grid.arrange(hm5, hm6, hm7, nrow = 3)
+```
+
+Examining the bookings by sub-regions, we can see that within Europe, most bookings come from Southern Europe. Since the hotels are located in Portugal, this seems to indicate that many of the booked stays may be domestic trips. The heat map of European sub-regions reveals that Western and Northern Europe have similar amounts of trips booked, while Eastern Europe has relatively few trips overall. In the Americas, the two subregions appear to have similar overall bookings, though North America's bookings are heavily concentrated in the summer. Latin America and the Caribbean  more consistent bookings throughout the year, with spring being the most popular. In Asia, the vast majority of bookings come from Eastern Asia, with other three regions booking in similar amounts.
+
+```{r, message = F, echo = F}
+country_bookings = hotel_bookings %>% group_by(region, `country name`) %>%
+    summarize(bookings = n(), num_cancellations = sum(is_canceled),
+              cancellation_rate = num_cancellations / bookings)
+country_bookings$`country name`[`country_bookings`$`country name` ==
+                                "United Kingdom of Great Britain and Northern Ireland"] =
+                                "UK"
+country_bookings$`country name`[`country_bookings`$`country name` == "Czechia"] = 
+                                "Czech Republic"
+country_bookings$`country name`[`country_bookings`$`country name` ==
+                                "Russian Federation"] = 
+                                "Russia"
+
+world = map_data("world")
+world = left_join(world, country_bookings, by = c("region" = "country name"))
+
+europe = world %>% filter(long > -12, long < 35, lat > 35, lat < 72)
+```
+
+```{r, echo = F}
+map1 = ggplot() +
+    geom_polygon(data = europe, mapping = aes(x = long, y = lat,
+                                              group = group, fill = bookings),
+                 color = "black") +
+    scale_fill_gradient(low = "yellow", high = "red") +
+    labs(title = "Bookings by Country, Europe") +
+    theme(legend.position = "bottom",
+          legend.text = element_text(angle = 45, vjust = 1, hjust = 1))
+
+map2 = ggplot() +
+    geom_polygon(data = europe, mapping = aes(x = long, y = lat,
+                                              group = group, fill = cancellation_rate),
+                 color = "black") +
+    scale_fill_gradient(low = "yellow", high = "red") +
+    labs(title = "Cancel Rate by Country, Europe") +
+    theme(legend.position = "bottom")
+
+grid.arrange(map1, map2, ncol = 2)
+```
+The map above reveals the booking amounts of each European country. Just as revealed by the heat maps of subregions, Southern Europe has the largest amount of bookings. Moving more north and east follows the expected trend of decreased bookings. This trend makes sense since the different subregions are reasonable proxies for the relative wealth of the countries within those subregions. Western and Southern Europe tend to contain the wealthiest countries, while Eastern Europe tends to contain the poorest countries in Europe. Southern Europe's large amount of bookings can likely be attributed to the ease of access since the hotels are located in Portugal. The cancellation rates appear to follow a reverse trend compared to the booking amounts of each subregion. Eastern Europe appears to have higher cancellation rates than Western and Northern Europe. Portugal has a noticeably high cancellation rate, though this is likely due to the high amount of bookings coming from Portugal.
+
+```{r, echo = F}
+cancellation_by_region = hotel_bookings %>% group_by(region) %>%
+    summarize(num_bookings = n(), cancel_rate = sum(is_canceled) / n())
+cancellation_by_region
+```
+
+***
+\newpage
+
+## 4. How does the type of room correlate with cancellation?
+
+```{r, echo = F, fig.height = 4}
+b1 = ggplot(data = hotel_bookings) +
+    geom_bar(mapping = aes(x = assigned_room_type, group = factor(is_canceled),
+                           fill = factor(is_canceled)))
+
+b2 = ggplot(data = hotel_bookings) +
+    geom_bar(mapping = aes(x = assigned_room_type, group = factor(is_canceled),
+                           fill = factor(is_canceled)), position = "fill")
+grid.arrange(b1, b2, nrow = 2)
+```
+
+```{r, echo = F, fig.height = 4}
+b3 = ggplot(data = hotel_bookings) +
+    geom_bar(mapping = aes(x = reserved_room_type, group = factor(is_canceled),
+                           fill = factor(is_canceled)))
+
+b4 = ggplot(data = hotel_bookings) +
+    geom_bar(mapping = aes(x = reserved_room_type, group = factor(is_canceled),
+                           fill = factor(is_canceled)), position = "fill")
+grid.arrange(b3, b4, nrow = 2)
+```
+
+```{r, message = F, echo = F}
+room_type = hotel_bookings %>% group_by(reserved_room_type, assigned_room_type) %>%
+    summarize(num_book = n(), num_cancel = sum(is_canceled),
+              cancel_rate = num_cancel / num_book)
+
+ggplot(data = room_type) +
+    geom_tile(mapping = aes(x = reserved_room_type, y = assigned_room_type, fill = num_cancel))
+```
+
+The cancellation rate based on room type is fairly consistent, so there is likely no relationship between cancelling and room type. There is also a very large imbalance in the room types represented, with type A representing a very large majority of the assigned and reserved rooms. This imbalance in category sizes exacerbates the weakness of any meaningful relationship that could exist with cancellation.
+
+```{r, echo = F}
+logit_assign_room = glm(is_canceled ~ assigned_room_type, binomial, hotel_bookings)
+logit_reserve_room = glm(is_canceled ~ reserved_room_type, binomial, hotel_bookings)
+logit_room = glm(is_canceled ~ assigned_room_type + reserved_room_type, binomial, hotel_bookings)
+
+prob_assign_room = predict(logit_assign_room, type = "response")
+prob_reserve_room = predict(logit_reserve_room, type = "response")
+prob_room = predict(logit_room, type = "response")
+
+predict_assign_room = prob_assign_room > 0.5
+predict_reserve_room = prob_reserve_room > 0.5
+predict_room = prob_room > 0.5
+```
+
+```{r, echo = F}
+assign.room.confusion.matrix = table(as.logical(hotel_bookings$is_canceled), predict_assign_room)
+assign.room.confusion.matrix
+
+TN = assign.room.confusion.matrix["FALSE", "FALSE"]
+TP = assign.room.confusion.matrix["TRUE", "TRUE"]
+FP = assign.room.confusion.matrix["FALSE", "TRUE"]
+FN = assign.room.confusion.matrix["TRUE", "FALSE"]
+
+print("Assigned Room Evaluation")
+print(paste("Accuracy:", (TN + TP) / nrow(hotel_bookings)))
+print(paste("TPR:", TP / (TP + FN)))
+print(paste("TNR:", TN / (TN + FP)))
+
+reserve.room.confusion.matrix = table(as.logical(hotel_bookings$is_canceled), predict_reserve_room)
+reserve.room.confusion.matrix
+
+TN = reserve.room.confusion.matrix["FALSE", "FALSE"]
+TP = reserve.room.confusion.matrix["TRUE", "TRUE"]
+FP = reserve.room.confusion.matrix["FALSE", "TRUE"]
+FN = reserve.room.confusion.matrix["TRUE", "FALSE"]
+
+print("Reserved Room Evaluation")
+print(paste("Accuracy:", (TN + TP) / nrow(hotel_bookings)))
+print(paste("TPR:", TP / (TP + FN)))
+print(paste("TNR:", TN / (TN + FP)))
+
+room.confusion.matrix = table(as.logical(hotel_bookings$is_canceled), predict_room)
+room.confusion.matrix
+
+TN = room.confusion.matrix["FALSE", "FALSE"]
+TP = room.confusion.matrix["TRUE", "TRUE"]
+FP = room.confusion.matrix["FALSE", "TRUE"]
+FN = room.confusion.matrix["TRUE", "FALSE"]
+
+print("Assigned & Reserved Room Evaluation")
+print(paste("Accuracy:", (TN + TP) / nrow(hotel_bookings)))
+print(paste("TPR:", TP / (TP + FN)))
+print(paste("TNR:", TN / (TN + FP)))
+```
+
+The results of the logistic regressions between cancellation and room type, whether reserved or assigned, indicate that room type has no meaningful relationship with cancellation. Each of the three logistic regressions have an accuracy of 62%, which is only slightly better than guessing if a guest will cancel. Additionally, the TNR is effectively 1, while the TPR is effectively 0. Since these two metrics are at extremes, the model must be guessing since the vast majority of the predictions are that a booking will not be cancelled. This means that the accuracy of the model can be attributed to the imbalance in the number of cancellations and the number of non-cancellations. If the cancellation rade were 50%, the model's accuracy would be 50%.
+
+***
+\newpage
+
+## 5. Does the number of guests affect the likelihood of a booking being cancelled?
+
+```{r, message = F, echo = F}
+hotel_bookings = hotel_bookings %>%
+    mutate(total_guests = adults + children + babies)
+
+data_guests1 <- hotel_bookings  %>% 
+  group_by(total_guests, is_canceled) %>%
+  summarize(count = n()) %>%
+  arrange(desc(is_canceled)) %>%
+  filter(is_canceled == 1)
+
+data_guests2 <- hotel_bookings  %>% 
+  group_by(total_guests) %>%
+  summarize(count = n())  
+
+# anything beyond 5 guests super small sample size
+result_guests <- data_guests1 %>%
+  inner_join(data_guests2, by = c("total_guests")) %>%
+  mutate(proportion = count.x / count.y) %>%
+  filter(proportion < 0.5)
+```
+
+```{r, message = F, echo = F, fig.height = 4}
+ggplot(data = result_guests, 
+       mapping = aes(x = total_guests, y = proportion)) +
+  geom_point() + 
+  geom_smooth(method = "glm", se = F) +
+  labs(x = "Total Guests", y = "Proportion Cancelled",
+       title = "Proportion Cancelled v. Total Guests")
+
+ggplot(data = hotel_bookings %>% filter(total_guests > 0,total_guests <= 5)) +
+    geom_bar(mapping = aes(x = total_guests, fill = factor(is_canceled))) +
+  labs(x = "Total Guests", y = "Number of Bookings",
+       title = "Number of Bookings v. Total Guests")
+
+summary(glm(proportion ~ total_guests,data = result_guests))
+summary(glm(is_canceled ~ total_guests, family = binomial, data = hotel_bookings))
+```
+
+The total number of guests does not have a significant relationship with the cancellation rate, but it does have a relationship indicating if a particular booking will be cancelled. The majority of bookings were made for 2 guests, and such bookings had a higher proportion of cancellations. This may be due to the imbalance in number of guests, so number of guests may not be a very reliable indicator of cancellation.
+
+***
+\newpage
+
+## 6. Do cancellations occur in greater proportion the more days are booked?
+
+``` {r, message = F, echo = F}
+hotel_bookings = hotel_bookings %>%
+    mutate(total_nights = stays_in_weekend_nights + stays_in_week_nights)
+
+data1 <- hotel_bookings  %>% 
+  group_by(total_nights, is_canceled) %>%
+  summarize(count = n()) %>%
+  arrange(desc(is_canceled)) %>%
+  filter(is_canceled == 1)
+
+data2 <- hotel_bookings  %>% 
+  group_by(total_nights) %>%
+  summarize(count = n())  
+
+result <- data1 %>%
+  inner_join(data2, by = c("total_nights")) %>%
+  mutate(proportion = count.x / count.y) %>%
+    filter(count.y > 100) # prevent skewing by outliers
+```
+
+```{r, message = F, echo = F, fig.height = 4}
+ggplot(data = result, 
+       mapping = aes(x = total_nights, y = proportion)) +
+  geom_point() + 
+  geom_smooth(method = "glm", se = F) +
+  labs(x = "Total Nights Spent", y = "Proportion Cancelled",
+       title = "Proportion Cancelled v. Total Nights Spent")
+
+ggplot(data = hotel_bookings %>% filter(total_nights <= 30)) +
+    geom_bar(mapping = aes(x = total_nights, fill = factor(is_canceled)))  +
+  labs(x = "Total Nights Spent", y = "Number of Bookings",
+       title = "Number of Bookings v. Total Nights Spent")
+
+summary(glm(proportion ~ total_nights,data =  result))
+summary(glm(is_canceled ~ total_nights, family = binomial, data = hotel_bookings))
+```
+The total number of nights does not have a significant relationship with the cancellation rate, but it does have a relationship with determining if a particular booking will be cancelled. Although the proportion of cancellations appears to increase with the number of total nights spent, the increase in cancellation rate can be explained by the small sample size. Most bookings were for 7 days or less, so the higher cancellation rate for longer trips is due to low sample size.
+
+***
+\newpage
+
+## 7. Are business trips more likely to have hotel cancellations?
+
+```{r, echo = F}
+hotel_bookings %>%
+  group_by(distribution_channel) %>%
+  summarise(num_canceled = sum(is_canceled),
+            total = n(),
+            prop_canceled = num_canceled/total) %>%
+  arrange(desc(total))
+```
+
+Business trips appear to have a lower proportion of cancellations, but it is possible that the lower proportion is due to small sample size. Only about 6500 trips were business trips, which is only small portion of the overall data.
+
+***
+
+## 8. Does the days booked in advance affect hotel cancellation?
+
+```{r, echo = F}
+ggplot(data = hotel_bookings, aes(x = factor(is_canceled), y = lead_time)) +
+  geom_boxplot(aes(col = factor(is_canceled))) +
+  ggtitle("Lead Time and Cancellation")
+```
+
+The boxplots show that the median `lead_time` differs for trips based on whether they were canceled or not. This indicates that `lead_time` likely has a significant relationship with cancellation.
+
+***
+\newpage
+
+# Predictive Models
+
+## Logistic Regression
+
+```{r, echo = F, warning = F}
+set.seed(167)
+train.idx = sample(nrow(hotel_bookings),  (4 * nrow(hotel_bookings)) / 5)
+train = hotel_bookings[train.idx, ]
+test = hotel_bookings[-train.idx, ]
+
+# regression formula
+f = "is_canceled ~ hotel + lead_time + arrival_date_month + stays_in_weekend_nights +
+    stays_in_week_nights + is_repeated_guest + previous_cancellations +
+    previous_bookings_not_canceled + booking_changes +
+    deposit_type + adr + total_of_special_requests + region + market_segment +
+    distribution_channel + customer_type"
+```
+
+```{r, warning = F}
+logit = glm(f, binomial(), train)
+prob = predict(logit, type = "response", train)
+cancel_predictions_train = tibble(canceled = as.logical(train$is_canceled),
+                                  prob = prob, predict = prob > 0.5)
+logit.train.confusion.matrix = table(cancel_predictions_train$canceled,
+                                     cancel_predictions_train$predict)
+prob = predict(logit, type = "response", test)
+cancel_predictions_test = tibble(canceled = as.logical(test$is_canceled),
+                                 prob = prob, predict = prob > 0.5)
+logit.test.confusion.matrix = table(cancel_predictions_test$canceled,
+                                    cancel_predictions_test$predict)
+```
+
+
+```{r, echo = F, warning = F}
+TN = logit.train.confusion.matrix["FALSE", "FALSE"]
+TP = logit.train.confusion.matrix["TRUE", "TRUE"]
+FP = logit.train.confusion.matrix["FALSE", "TRUE"]
+FN = logit.train.confusion.matrix["TRUE", "FALSE"]
+
+print("Training Set Evaluation")
+# evaluate model on training data
+logit.train.confusion.matrix
+print(paste("Accuracy:", (TN + TP) / nrow(cancel_predictions_train)))
+print(paste("TPR:", TP / (TP + FN)))
+print(paste("TNR:", TN / (TN + FP)))
+```
+
+```{r, echo = F}
+TN = logit.test.confusion.matrix["FALSE", "FALSE"]
+TP = logit.test.confusion.matrix["TRUE", "TRUE"]
+FP = logit.test.confusion.matrix["FALSE", "TRUE"]
+FN = logit.test.confusion.matrix["TRUE", "FALSE"]
+
+print("Testing Set Evaluation")
+# evaluate model on testing data
+logit.test.confusion.matrix
+print(paste("Accuracy:", (TN + TP) / nrow(cancel_predictions_test)))
+print(paste("TPR:", TP / (TP + FN)))
+print(paste("TNR:", TN / (TN + FP)))
+```
+
+Performing logistic regression yields fairly high model accuracy, though the TPR appears to suffer in exchange for a very high TNR. This indicates that the model can accurately identify guests that will not cancel, but may still be guessing when guests actually cancel. The training and testing sets yielded similar performance, so we know that the model is representative of the overall data, rather than a very specific subset.
+
+***
+\newpage
+
+## Decision Tree
+
+```{r, echo = F}
+set.seed(155)
+# sample 0.25 
+index <- sample(nrow(hotel_bookings), nrow(hotel_bookings)*0.25)
+
+test <- hotel_bookings[index,]
+training <- hotel_bookings[-index,]
+```
+
+```{r, echo = F}
+features_1 <- training[c("hotel","is_canceled","lead_time","adults", "total_of_special_requests",
+                      "children","meal","distribution_channel","is_repeated_guest",
+                      "previous_cancellations","booking_changes", "previous_bookings_not_canceled",
+                      "deposit_type","customer_type","adr","required_car_parking_spaces")]
+```
+
+```{r}
+training_model <- rpart(is_canceled ~ .,
+                      data=features_1, 
+                      method="class", 
+                      control=rpart.control(cp=0.3))
+
+rpart.plot(training_model)
+```
+`rpart` organizes the features by significance and the number of features used is decided by the complexity. From this low complexity decision tree we can see that `deposit_type` is the most significant factor for predicting hotel cancellations.
+
+```{r}
+max_cp_model <- rpart(is_canceled ~ .,
+                      data=features_1, 
+                      method="class", 
+                      control=rpart.control(cp=0.005))
+
+rpart.plot(max_cp_model)
+```
+A high complexity decision tree is very likely to be overfit, and as a result, may have many irrelevant features that don't contribute much to prediction. To avoid overfitting, high complexity trees should be pruned to only include the most relevant features.
+
+```{r}
+#classification tree probability
+test$ct_pred_prob <- predict(training_model,test)[,2]
+test$ct_pred_class <- predict(training_model,test,type="class")
+
+table(test$is_canceled == test$ct_pred_class)
+```
+```{r, echo = F}
+# max complexity stopped at depth of 6
+full_tree<-rpart(is_canceled~.,
+                     data=features_1, 
+                     method="class",
+                     control=rpart.control(cp=0, maxdepth =4))
+
+rpart.plot(full_tree, main = "Unpruned Full Decision Tree")
+```
+```{r}
+# which features are most important to the decision tree
+full_tree$variable.importance
+```
+
+```{r}
+printcp(full_tree)
+```
+
+```{r}
+# plot complexity parameter
+plotcp(full_tree)
+```
+`cpplot()` does cross validation for different complexity levels and plots the cross validation error on the y-axis.
+
+```{r, echo = F}
+min_xerror <- full_tree$cptable[which.min(full_tree$cptable[,"xerror"]),]
+min_xerror
+
+pruned_full_tree <- prune(full_tree, cp=min_xerror[1])
+
+min_xerror[1]
+
+rpart.plot(pruned_full_tree, main = "Pruned Decision Tree")
+```
+
+After determining that a tree with complexity of 4 is the most effective tree, we prune the tree so that only 4 decisions are made. The decisions made by the pruned tree will only reflect the 4 most important features.
+```{r, echo = F}
+tree.pred <- predict(pruned_full_tree, test, type = "class")
+```
+
+```{r, echo = F}
+pruned.tree.confusion.matrix = table(test$is_canceled, tree.pred)
+TN = pruned.tree.confusion.matrix["0", "0"]
+TP = pruned.tree.confusion.matrix["1", "1"]
+FP = pruned.tree.confusion.matrix["0", "1"]
+FN = pruned.tree.confusion.matrix["1", "0"]
+
+pruned.tree.confusion.matrix
+print(paste("Accuracy:", (TN + TP) / nrow(test)))
+print(paste("TPR:", TP / (TP + FN)))
+print(paste("TNR:", TN / (TN + FP)))
+```
+The decision tree has an accuracy of 76.9%, a TPR of 37.9% and a TNR of 99.8%. Overall this performance is similar to that of the logistic regression, though the TPR is noticeably smaller than the logistic regression's 57%. However, the logistic regression used many more predictors to achieve similar performance, so the decision tree likely can likely be more generalized since the logistic regression could be overfit.
+
+***
+\newpage
+
+## KNN
+```{r, echo = F, eval = F}
+# k-fold cross validation for KNN
+hotel_bookings = na.omit(hotel_bookings)
+
+set.seed(3033)
+intrain <- createDataPartition(y = hotel_bookings$is_canceled, p = 0.7, list = FALSE)
+train <- hotel_bookings[intrain,]
+test <- hotel_bookings[-intrain,]
+
+train[["is_canceled"]] <- factor(train[["is_canceled"]], levels = c(0, 1))
+test[["is_canceled"]] <- factor(test[["is_canceled"]], levels = c(0, 1))
+
+trctrl <- trainControl(method = "repeatedcv", number = 10, repeats = 3)
+set.seed(3333)
+```
+
+
+```{r, eval = F}
+knn_fit <- train(is_canceled ~ deposit_type + lead_time + previous_cancellations +
+                 previous_bookings_not_canceled + is_repeated_guest + distribution_channel +
+                     adr, data = train, method = "knn",
+                 trControl = trctrl,
+                 preProcess = c("center", "scale"),
+                 tuneLength = 10)
+knn_fit
+
+# accuracy vs k-folds
+plot(knn_fit)
+```
+
+From the plot and printout, we can see that $k = 11$ yields the most accurate model. However, since the classes are imbalanced, $\kappa$ may be a more appropriate metric. Using $\kappa$ the best model is actually $k = 5$ though the difference in performance is not very significant.
+
+```{r, echo = F, eval = F}
+test_pred <- predict(knn_fit, newdata = test)
+train_pred <- predict(knn_fit, newdata = train)
+```
+
+
+```{r, echo = F, eval = F}
+# confusion matrices
+confusionMatrix(test_pred, test$is_canceled)
+confusionMatrix(train_pred, train$is_canceled)
+```
+
+***
+\newpage
+
+# Findings and Conclusions
+
+From our models, we learned that the most important predictors of cancellation were variables related to how a booking is paid for as well as a guest`s previous history of booking at the hotel.
+Overall, each of the three models we used performed pretty similarly. The decision tree is the most easily interpretable model since its design mimics human decision-making processes. Although the TPR is lower for the tree, its simplicity makes up for the loss in ability to distinguish which bookings will actually cancel. The tree is able to make predictions using a maximum of 4 variables, but the logistic regression requires many more predictors for slightly better performance. Similarly, the tree can be built much more quickly than the KNN model, which makes it useful for quick insight. The KNN model is the most accurate model and has the highest TPR, but comes at the cost of incredibly long run times due to the size of the data. The TPR is also only slightly higher than that of the logistic regression, though the KNN uses only 7 predictors to achieve this performance. We also know that it is actually finding patterns in the data because its $\kappa$ coefficient is a value near 0.5. $\kappa$ can take any value between -1 and 1, where negative values indicate worse performance than guessing, and positive values represent better performance than guessing. Unfortunately, its run times may be prohibitively long, so logistic regression is a much more practical method of prediction. Logistic regression is an effective model for predicting cancellations, and seems to be a good compromise between the speed of the decision tree and complexity of KNN. 
+
+***
